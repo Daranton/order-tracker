@@ -79,6 +79,62 @@ Not in initial scope. API-first design ensures any future frontend (React, Vue, 
 - User authentication with token refresh and revocation
 - Admin stock management
 
+## Security Considerations
+
+### Order Management
+- All order endpoints require authentication — unauthenticated users cannot view or create orders
+- Users may only read/modify their own orders; admin role required to access other users' orders (enforce at the API layer, not just the UI)
+- Order state transitions (pending → paid → shipped → cancelled) must be validated server-side; clients cannot set arbitrary states
+- Log all state transitions with user ID and timestamp for audit trail
+
+### Structured Data Management
+- Passwords are stored as bcrypt hashes — never logged, never returned in API responses
+- Sensitive fields (card details, full payment info) are never stored locally — delegated entirely to the payment gateway
+- Database credentials are injected via environment variables; never hardcoded or committed
+- PostgreSQL user for the app should have least-privilege access (no `DROP`, no `TRUNCATE` in production)
+
+### Payment Processing
+- Never handle raw card data — use Stripe.js / gateway-hosted fields so card numbers never touch the server
+- Validate all incoming webhook calls using the gateway's signature verification (e.g., `stripe.WebhookEvent.construct_from` with the signing secret)
+- Idempotency keys on all payment requests to prevent duplicate charges on Celery retries
+- Payment amounts are always calculated server-side — never trust a price sent from the client
+- Failed payment events trigger immediate reservation release to restore stock
+
+### Inventory Booking (DoS Prevention)
+- **Per-user reservation cap**: maximum 3–5 active reservations at once — no legitimate user needs more
+- **Rate limit checkout initiation**: e.g., 10 reservations/hour per account, 3/minute per IP
+- **Account verification required**: email-verified accounts only; detect and reject disposable email domains
+- **Payment method required before reservation**: tying a real payment method to the account deters throwaway attacks
+- **Abandonment rate monitoring**: accounts with high reservation-to-payment abandonment ratios are flagged and rate-limited further or suspended
+- **Stock spike alerting**: alert if >50% of any item's stock is reserved within a short window (e.g., 1 minute)
+- **Short TTL**: keep reservation window at 10–15 minutes; shorter for high-demand items
+- **Per-item user cap**: a single user cannot hold more than a set percentage of any item's total stock
+
+### Stock Management
+- Stock level updates (restock, manual adjustments) are admin-only endpoints
+- All stock mutations go through atomic Redis operations + PostgreSQL transactions to prevent race conditions
+- Stock cannot be decremented below zero — enforce at the DB level with a `CHECK (quantity >= 0)` constraint, not just application logic
+
+### Authentication & JWT
+- Access tokens expire in 15 minutes; refresh tokens in 7 days
+- Refresh tokens are stored server-side in Redis — revocation is immediate (logout, password change, suspicious activity)
+- Brute force protection: rate limit login, register, and password-reset endpoints; lock account after N consecutive failures
+- Passwords must meet minimum complexity requirements (length, character classes)
+- Password reset tokens are single-use, short-lived (15 min), and invalidated after use
+
+### Transport & Infrastructure
+- HTTPS/TLS enforced in all non-local environments; HTTP requests redirected to HTTPS
+- CORS configured explicitly — do not use wildcard `*` in production
+- Docker containers run as non-root users
+- Secrets (DB credentials, JWT secret, Stripe keys) managed via `.env` locally and a secrets manager (AWS Secrets Manager / HashiCorp Vault) in production — `.env` is in `.gitignore`
+- Dependency versions are pinned and regularly audited (`pip audit` in CI)
+
+### Observability & Incident Response
+- Never log sensitive data: passwords, tokens, card numbers, or full request bodies on auth endpoints
+- Structured logs include user ID and request ID for traceability, but not PII beyond what is necessary
+- Sentry alerts on unhandled exceptions; on-call runbook documented for payment and stock failures
+- Health check endpoints (`/health`, `/ready`) do not expose internal system details in their responses
+
 ## Development Setup (Planned)
 ```bash
 cp .env.example .env        # configure local secrets
@@ -99,3 +155,4 @@ uvicorn app.main:app --reload
 - [ ] Add structured logging, Sentry, and health check endpoints
 - [ ] CI/CD pipeline (GitHub Actions)
 - [ ] Write integration test suite
+
